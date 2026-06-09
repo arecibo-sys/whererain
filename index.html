@@ -346,23 +346,25 @@ async function fetchRadarManifest() {
     const data = await res.json();
     state.radarManifest = data;
     const now = Date.now() / 1000;
-    const past = (data.radar.past || [])
-      .map(f => ({ time: f.time, path: f.path, kind: 'past' }))
-      .filter(f => f.time >= now - 10 * 60);
+    const allPast = (data.radar.past || []).map(f => ({ time: f.time, path: f.path, kind: 'past' }));
     const nowcast = (data.radar.nowcast || []).map(f => ({ time: f.time, path: f.path, kind: 'nowcast' }));
-    // Last 10 min of past as context + all nowcast; fall back to all past if no nowcast
-    const frames = nowcast.length > 0
-      ? [...past, ...nowcast]
-      : past;
+    // Find the frame closest to 10 min ago as the start point
+    const startTime = now - 10 * 60;
+    let startIdx = 0;
+    for (let i = 0; i < allPast.length; i++) {
+      if (allPast[i].time >= startTime) { startIdx = i; break; }
+      startIdx = i;
+    }
+    const past = allPast.slice(startIdx);
+    const frames = [...past, ...nowcast];
     state.radarFrames = frames;
-    state.radarNowcastStart = nowcast.length > 0 ? Math.max(0, frames.length - nowcast.length) : 0;
-    state.radarFrameIdx = state.radarNowcastStart;
+    // Animation loops only from the first past frame through end of nowcast
+    state.radarNowcastStart = 0;
+    state.radarFrameIdx = 0;
     $('radarScrub').max = Math.max(0, frames.length - 1);
-    $('radarScrub').value = state.radarFrameIdx;
-    const label = nowcast.length > 0
-      ? `${nowcast.length} forecast frames · next ${Math.round((nowcast[nowcast.length-1].time - nowcast[0].time) / 60)} min`
-      : `${past.length} past frames`;
-    $('radarMeta').textContent = label;
+    $('radarScrub').value = 0;
+    const totalMins = frames.length > 1 ? Math.round((frames[frames.length-1].time - frames[0].time) / 60) : 0;
+    $('radarMeta').textContent = `${frames.length} frames · -10min → +${totalMins - 10}min forecast`;
     showRadarFrame();
   } catch (e) {
     $('radarMeta').textContent = 'Radar unavailable';
