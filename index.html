@@ -200,7 +200,7 @@ body {
   <!-- Live radar -->
   <div class="card" style="padding: 12px;">
     <div class="card-title">
-      <span><span class="live-dot"></span>LIVE RADAR</span>
+      <span><span class="live-dot"></span>RAIN FORECAST</span>
       <span id="radarMeta" style="opacity: 0.6;">Loading…</span>
     </div>
     <div class="radar-wrap">
@@ -308,14 +308,15 @@ const WMO = {
 const $ = id => document.getElementById(id);
 
 // ── Map init ──
-let map, marker, radarLayer;
+let map, marker, radarLayerGroup;
 function initMap() {
-  map = L.map('radar-map', { zoomControl: true, attributionControl: true, minZoom: 3, maxZoom: 9 }).setView([state.lat, state.lon], 7);
+  map = L.map('radar-map', { zoomControl: true, attributionControl: true, minZoom: 5, maxZoom: 11 }).setView([state.lat, state.lon], 9);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
     subdomains: 'abcd', maxZoom: 19,
-    attribution: '© OSM © CARTO · Radar © RainViewer'
+    attribution: '© OSM © CARTO · Forecast © Open-Meteo'
   }).addTo(map);
   marker = L.marker([state.lat, state.lon]).addTo(map);
+  radarLayerGroup = L.layerGroup().addTo(map);
   map.on('click', e => {
     state.lat = e.latlng.lat; state.lon = e.latlng.lng;
     state.name = `Pin (${state.lat.toFixed(2)}, ${state.lon.toFixed(2)})`;
@@ -325,66 +326,104 @@ function initMap() {
   });
 }
 
-function setRadarFrame(path) {
-  if (radarLayer) map.removeLayer(radarLayer);
-  if (!path) return;
-  radarLayer = L.tileLayer(`https://tilecache.rainviewer.com${path}/256/{z}/{x}/{y}/2/1_1.png`, {
-    tileSize: 256, opacity: 0.75,
-    minZoom: 3, maxZoom: 9, maxNativeZoom: 9,
-    attribution: 'Radar: RainViewer',
-    errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
-  }).addTo(map);
-  // Suppress Leaflet's "Zoom Level Not Supported" overlay
-  radarLayer.on('tileerror', () => {});
+// ── Forecast radar (Open-Meteo precipitation grid) ──
+// Builds a grid of points around the location, fetches the 15-min precip
+// forecast for all of them in ONE request, and animates rain moving forward.
+const GRID_N = 11;          // 11×11 = 121 sample points
+const SPAN_LAT = 0.9;       // ~100 km tall coverage
+const SPAN_LON = 1.6;       // wider since longitude is compressed at high latitude
+
+// precip (mm/15min) → [color, fillOpacity]
+function precipColor(p) {
+  if (p < 0.05) return null;
+  if (p < 0.3)  return ['#4A90E2', 0.35];
+  if (p < 0.8)  return ['#5BA3F5', 0.5];
+  if (p < 1.8)  return ['#FFD700', 0.6];
+  if (p < 4)    return ['#FF6B6B', 0.7];
+  return ['#B71C1C', 0.8];
 }
 
-// ── RainViewer manifest ──
 async function fetchRadarManifest() {
   try {
-    const res = await fetch('https://api.rainviewer.com/public/weather-maps.json');
-    if (!res.ok) throw new Error('manifest ' + res.status);
+    const cLat = state.lat, cLon = state.lon;
+    const stepLat = SPAN_LAT / (GRID_N - 1);
+    const stepLon = SPAN_LON / (GRID_N - 1);
+    const lats = [], lons = [], grid = [];
+    for (let r = 0; r < GRID_N; r++) {
+      for (let c = 0; c < GRID_N; c++) {
+        const la = +(cLat - SPAN_LAT/2 + r*stepLat).toFixed(4);
+        const lo = +(cLon - SPAN_LON/2 + c*stepLon).toFixed(4);
+        lats.push(la); lons.push(lo); grid.push({ lat: la, lon: lo });
+      }
+    }
+    state.grid = grid;
+    state.gridStepLat = stepLat;
+    state.gridStepLon = stepLon;
+
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lats.join(',')}&longitude=${lons.join(',')}&minutely_15=precipitation&forecast_days=1&timezone=GMT`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('forecast-grid ' + res.status);
     const data = await res.json();
-    state.radarManifest = data;
+    const locs = Array.isArray(data) ? data : [data];
+
+    // Build a time axis (shared across points) and find the first future step
+    const times = (locs[0].minutely_15?.time || []).map(t => Date.parse(t + 'Z') / 1000);
     const now = Date.now() / 1000;
-    const past = (data.radar.past || []).map(f => ({ time: f.time, path: f.path, kind: 'past' }));
-    const nowcast = (data.radar.nowcast || []).map(f => ({ time: f.time, path: f.path, kind: 'nowcast' }));
-    const frames = [...past, ...nowcast];
-    if (!frames.length) { $('radarMeta').textContent = 'No radar data'; return; }
+    let startIdx = times.findIndex(t => t >= now - 7.5 * 60); // include the current 15-min slot
+    if (startIdx < 0) startIdx = 0;
+    const STEPS = 10; // 10 × 15 min = next ~2.5 hours
+
+    const frames = [];
+    for (let s = startIdx; s < Math.min(times.length, startIdx + STEPS); s++) {
+      const precip = locs.map(l => l.minutely_15?.precipitation?.[s] ?? 0);
+      frames.push({ time: times[s], precip });
+    }
+    if (!frames.length) { $('radarMeta').textContent = 'No forecast data'; return; }
+
     state.radarFrames = frames;
-    state.radarNowcastStart = past.length;
     state.radarFrameIdx = 0;
     $('radarScrub').max = frames.length - 1;
     $('radarScrub').value = 0;
-    const lastMins = Math.round((frames[frames.length - 1].time - now) / 60);
-    const lastLabel = lastMins >= 0 ? `+${lastMins}m forecast` : `${Math.abs(lastMins)}m ago`;
-    $('radarMeta').textContent = `${frames.length} frames · ${lastLabel}`;
+    const span = Math.round((frames[frames.length - 1].time - frames[0].time) / 60);
+    $('radarMeta').textContent = `Forecast · next ${span} min`;
     showRadarFrame();
   } catch (e) {
-    $('radarMeta').textContent = 'Radar unavailable';
+    $('radarMeta').textContent = 'Forecast unavailable';
     console.error('radar', e);
   }
 }
 
 function showRadarFrame() {
   const f = state.radarFrames[state.radarFrameIdx];
-  if (!f) return;
-  setRadarFrame(f.path);
+  if (!f || !state.grid) return;
+  radarLayerGroup.clearLayers();
+  const hLat = state.gridStepLat / 2, hLon = state.gridStepLon / 2;
+  let maxP = 0;
+  f.precip.forEach((p, i) => {
+    if (p > maxP) maxP = p;
+    const col = precipColor(p);
+    if (!col) return;
+    const g = state.grid[i];
+    L.rectangle(
+      [[g.lat - hLat, g.lon - hLon], [g.lat + hLat, g.lon + hLon]],
+      { stroke: false, fillColor: col[0], fillOpacity: col[1] }
+    ).addTo(radarLayerGroup);
+  });
+
   const d = new Date(f.time * 1000);
   const hh = d.getHours().toString().padStart(2,'0');
   const mm = d.getMinutes().toString().padStart(2,'0');
   const diff = Math.round((f.time - Date.now()/1000) / 60);
-  const tag = f.kind === 'nowcast'
-    ? ` (+${diff}m)`
-    : diff === 0 ? ' (now)' : ` (${Math.abs(diff)}m ago)`;
-  $('radarTs').textContent = `${hh}:${mm}${tag}`;
+  const tag = diff <= 0 ? ' (now)' : ` (+${diff}m)`;
+  const rain = maxP < 0.05 ? '· dry' : `· up to ${maxP.toFixed(1)}mm`;
+  $('radarTs').textContent = `${hh}:${mm}${tag} ${rain}`;
   $('radarScrub').value = state.radarFrameIdx;
 }
 
 let radarTimer = null;
 function radarTick() {
   if (!state.radarPlaying || !state.radarFrames.length) return;
-  state.radarFrameIdx++;
-  if (state.radarFrameIdx >= state.radarFrames.length) state.radarFrameIdx = state.radarNowcastStart;
+  state.radarFrameIdx = (state.radarFrameIdx + 1) % state.radarFrames.length;
   showRadarFrame();
 }
 
@@ -546,6 +585,7 @@ async function fetchAll() {
     renderNowcast(nc);
     state.lastUpdate = Date.now();
     renderChips();
+    fetchRadarManifest(); // refresh forecast radar for the new location
   } catch (e) {
     console.error('fetchAll', e);
     $('nowcastStatus').textContent = 'Fetch failed — check connection';
@@ -614,8 +654,8 @@ fetchRadarManifest();
 fetchAll();
 setInterval(updateAge, 1000);
 setInterval(fetchAll, 5 * 60 * 1000);
-setInterval(fetchRadarManifest, 2 * 60 * 1000);
-radarTimer = setInterval(radarTick, 800);
+setInterval(fetchRadarManifest, 5 * 60 * 1000);
+radarTimer = setInterval(radarTick, 700);
 </script>
 </body>
 </html>
