@@ -348,23 +348,27 @@ async function fetchRadarManifest() {
     const now = Date.now() / 1000;
     const allPast = (data.radar.past || []).map(f => ({ time: f.time, path: f.path, kind: 'past' }));
     const nowcast = (data.radar.nowcast || []).map(f => ({ time: f.time, path: f.path, kind: 'nowcast' }));
-    // Find the frame closest to 10 min ago as the start point
+    // Start from ~10 min ago — find nearest past frame to that point
     const startTime = now - 10 * 60;
     let startIdx = 0;
     for (let i = 0; i < allPast.length; i++) {
       if (allPast[i].time >= startTime) { startIdx = i; break; }
-      startIdx = i;
+      if (i === allPast.length - 1) startIdx = Math.max(0, allPast.length - 4);
     }
     const past = allPast.slice(startIdx);
     const frames = [...past, ...nowcast];
+    if (!frames.length) { $('radarMeta').textContent = 'No radar data'; return; }
     state.radarFrames = frames;
-    // Animation loops only from the first past frame through end of nowcast
     state.radarNowcastStart = 0;
     state.radarFrameIdx = 0;
-    $('radarScrub').max = Math.max(0, frames.length - 1);
+    $('radarScrub').max = frames.length - 1;
     $('radarScrub').value = 0;
-    const totalMins = frames.length > 1 ? Math.round((frames[frames.length-1].time - frames[0].time) / 60) : 0;
-    $('radarMeta').textContent = `${frames.length} frames · -10min → +${totalMins - 10}min forecast`;
+    const firstMins = Math.round((frames[0].time - now) / 60);
+    const lastMins  = Math.round((frames[frames.length - 1].time - now) / 60);
+    const lastLabel = lastMins >= 0 ? `+${lastMins}m` : `${lastMins}m`;
+    $('radarMeta').textContent = nowcast.length
+      ? `${frames.length} frames · ${firstMins}m → ${lastLabel}`
+      : `${frames.length} frames · radar history (no forecast yet)`;
     showRadarFrame();
   } catch (e) {
     $('radarMeta').textContent = 'Radar unavailable';
