@@ -325,9 +325,10 @@ function initMap() {
   });
 }
 
-// Swap the RainViewer radar tile layer to the given frame path.
-function setRadarFrame(path) {
-  if (radarLayer) map.removeLayer(radarLayer);
+// Layers: real radar tiles (RainViewer) for recent, soft cloud overlay (Open-Meteo) for forecast.
+let radarImg = null;
+function setRadarTile(path) {
+  if (radarLayer) { map.removeLayer(radarLayer); radarLayer = null; }
   if (!path) return;
   radarLayer = L.tileLayer(`${state.radarHost}${path}/256/{z}/{x}/{y}/2/1_1.png`, {
     tileSize: 256, opacity: 0.8,
@@ -338,30 +339,80 @@ function setRadarFrame(path) {
   radarLayer.on('tileerror', () => {});
 }
 
-// ── RainViewer radar manifest ──
-// Real radar cloud imagery. Animates forecast frames when RainViewer provides
-// them; otherwise loops recent rain movement so the clouds never freeze.
+// ── Forecast cloud rendering (Open-Meteo precipitation grid) ──
+const GRID_N = 11;
+const SPAN_LAT = 0.9, SPAN_LON = 1.6;
+function precipRGBA(p) {
+  if (p < 0.05) return [0, 0, 0, 0];
+  if (p < 0.3)  return [74, 144, 226, 140];
+  if (p < 0.8)  return [91, 163, 245, 175];
+  if (p < 1.8)  return [255, 215, 0, 195];
+  if (p < 4)    return [255, 107, 107, 210];
+  return [183, 28, 28, 225];
+}
+function buildFrameImage(precip) {
+  const N = GRID_N, scale = 44, W = N * scale, H = N * scale;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+  const radius = scale * 2.3;
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+    const [pr, pg, pb, pa] = precipRGBA(precip[r * N + c] || 0);
+    if (pa === 0) continue;
+    const x = (c + 0.5) * scale, y = (N - 1 - r + 0.5) * scale, a = pa / 255;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, radius);
+    g.addColorStop(0, `rgba(${pr},${pg},${pb},${a})`);
+    g.addColorStop(0.5, `rgba(${pr},${pg},${pb},${a * 0.6})`);
+    g.addColorStop(1, `rgba(${pr},${pg},${pb},0)`);
+    ctx.fillStyle = g; ctx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
+  }
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const octx = out.getContext('2d'); octx.filter = 'blur(10px)'; octx.drawImage(cv, 0, 0);
+  return out.toDataURL('image/png');
+}
+async function buildForecastFrames(cLat, cLon) {
+  const stepLat = SPAN_LAT / (GRID_N - 1), stepLon = SPAN_LON / (GRID_N - 1);
+  const lats = [], lons = [];
+  for (let r = 0; r < GRID_N; r++) for (let c = 0; c < GRID_N; c++) {
+    lats.push(+(cLat - SPAN_LAT/2 + r*stepLat).toFixed(4));
+    lons.push(+(cLon - SPAN_LON/2 + c*stepLon).toFixed(4));
+  }
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lats.join(',')}&longitude=${lons.join(',')}&minutely_15=precipitation&forecast_days=1&timezone=GMT`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('forecast-grid ' + res.status);
+  const locs = await res.json();
+  const arr = Array.isArray(locs) ? locs : [locs];
+  const times = (arr[0].minutely_15?.time || []).map(t => Date.parse(t + 'Z') / 1000);
+  const now = Date.now() / 1000;
+  let start = times.findIndex(t => t > now);   // strictly future → prediction only
+  if (start < 0) start = 0;
+  const bounds = [[cLat - SPAN_LAT/2, cLon - SPAN_LON/2], [cLat + SPAN_LAT/2, cLon + SPAN_LON/2]];
+  const frames = [];
+  for (let s = start; s < Math.min(times.length, start + 8); s++) {   // next 2h
+    const precip = arr.map(l => l.minutely_15?.precipitation?.[s] ?? 0);
+    frames.push({ time: times[s], kind: 'forecast', img: buildFrameImage(precip), bounds });
+  }
+  return frames;
+}
+
+// ── Combined radar: recent real clouds + forecast clouds ──
 async function fetchRadarManifest() {
   try {
-    const res = await fetch('https://api.rainviewer.com/public/weather-maps.json');
-    if (!res.ok) throw new Error('manifest ' + res.status);
-    const data = await res.json();
-    state.radarHost = data.host || 'https://tilecache.rainviewer.com';
-    const past = (data.radar.past || []).map(f => ({ time: f.time, path: f.path, kind: 'past' }));
-    const nowcast = (data.radar.nowcast || []).map(f => ({ time: f.time, path: f.path, kind: 'nowcast' }));
-    // Recent past (last ~hour) for movement context + all forecast frames.
-    const recentPast = past.slice(-6);
-    const frames = [...recentPast, ...nowcast];
+    const [rvRes, fcFrames] = await Promise.all([
+      fetch('https://api.rainviewer.com/public/weather-maps.json').then(r => r.json()),
+      buildForecastFrames(state.lat, state.lon).catch(() => [])
+    ]);
+    state.radarHost = rvRes.host || 'https://tilecache.rainviewer.com';
+    const past = (rvRes.radar.past || []).map(f => ({ time: f.time, path: f.path, kind: 'radar' }));
+    const recentPast = past.slice(-4);                 // ~30 min of real radar movement
+    const frames = [...recentPast, ...fcFrames];
     if (!frames.length) { $('radarMeta').textContent = 'Radar unavailable'; return; }
-
     state.radarFrames = frames;
-    state.radarNowcastStart = recentPast.length;          // where the forecast begins
-    state.radarFrameIdx = 0;                              // play from oldest → forecast → loop
+    state.radarFrameIdx = 0;
     $('radarScrub').max = frames.length - 1;
     $('radarScrub').value = 0;
-    $('radarMeta').textContent = nowcast.length
-      ? `radar + ${nowcast.length}-step forecast`
-      : 'live radar (no forecast published)';
+    $('radarMeta').textContent = fcFrames.length
+      ? `radar + ${fcFrames.length * 15}min forecast`
+      : 'live radar';
     showRadarFrame();
   } catch (e) {
     $('radarMeta').textContent = 'Radar unavailable';
@@ -372,12 +423,23 @@ async function fetchRadarManifest() {
 function showRadarFrame() {
   const f = state.radarFrames[state.radarFrameIdx];
   if (!f) return;
-  setRadarFrame(f.path);
+  if (f.kind === 'forecast') {
+    if (radarLayer) { map.removeLayer(radarLayer); radarLayer = null; }
+    if (!radarImg) {
+      radarImg = L.imageOverlay(f.img, f.bounds, { opacity: 0.78, interactive: false }).addTo(map);
+    } else {
+      radarImg.setBounds(f.bounds); radarImg.setUrl(f.img);
+      if (!map.hasLayer(radarImg)) radarImg.addTo(map);
+    }
+  } else {
+    if (radarImg && map.hasLayer(radarImg)) map.removeLayer(radarImg);
+    setRadarTile(f.path);
+  }
   const d = new Date(f.time * 1000);
   const hh = d.getHours().toString().padStart(2,'0');
   const mm = d.getMinutes().toString().padStart(2,'0');
   const diff = Math.round((f.time - Date.now()/1000) / 60);
-  const tag = f.kind === 'nowcast'
+  const tag = f.kind === 'forecast'
     ? ` (+${diff}m forecast)`
     : (diff === 0 ? ' (now)' : ` (${Math.abs(diff)}m ago)`);
   $('radarTs').textContent = `${hh}:${mm}${tag}`;
@@ -549,6 +611,7 @@ async function fetchAll() {
     renderNowcast(nc);
     state.lastUpdate = Date.now();
     renderChips();
+    fetchRadarManifest(); // refresh forecast clouds for the new location
   } catch (e) {
     console.error('fetchAll', e);
     $('nowcastStatus').textContent = 'Fetch failed — check connection';
@@ -618,7 +681,7 @@ fetchAll();
 setInterval(updateAge, 1000);
 setInterval(fetchAll, 5 * 60 * 1000);
 setInterval(fetchRadarManifest, 5 * 60 * 1000);
-radarTimer = setInterval(radarTick, 600);
+radarTimer = setInterval(radarTick, 1100);
 </script>
 </body>
 </html>
