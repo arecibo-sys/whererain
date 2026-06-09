@@ -342,30 +342,37 @@ function precipRGBA(p) {
   return [183, 28, 28, 225];
 }
 
-// Render a grid of precip values into a smooth, blurred radar-like PNG.
+// Render the precip grid as soft, overlapping radial blobs → cloud-like radar.
 function buildFrameImage(precip) {
   const N = GRID_N;
-  const small = document.createElement('canvas');
-  small.width = N; small.height = N;
-  const sctx = small.getContext('2d');
-  const img = sctx.createImageData(N, N);
+  const scale = 44;                     // px per grid cell
+  const W = N * scale, H = N * scale;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+  const radius = scale * 2.3;           // blobs overlap generously → continuous field
   for (let r = 0; r < N; r++) {
     for (let c = 0; c < N; c++) {
       const [pr, pg, pb, pa] = precipRGBA(precip[r * N + c] || 0);
-      const x = c, y = N - 1 - r;          // image top = north (max lat)
-      const idx = (y * N + x) * 4;
-      img.data[idx] = pr; img.data[idx+1] = pg; img.data[idx+2] = pb; img.data[idx+3] = pa;
+      if (pa === 0) continue;
+      const x = (c + 0.5) * scale;
+      const y = (N - 1 - r + 0.5) * scale;   // image top = north (max lat)
+      const a = pa / 255;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, radius);
+      g.addColorStop(0,   `rgba(${pr},${pg},${pb},${a})`);
+      g.addColorStop(0.5, `rgba(${pr},${pg},${pb},${a * 0.6})`);
+      g.addColorStop(1,   `rgba(${pr},${pg},${pb},0)`);
+      ctx.fillStyle = g;
+      ctx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
     }
   }
-  sctx.putImageData(img, 0, 0);
-  const scale = 28;
-  const big = document.createElement('canvas');
-  big.width = N * scale; big.height = N * scale;
-  const bctx = big.getContext('2d');
-  bctx.imageSmoothingEnabled = true; bctx.imageSmoothingQuality = 'high';
-  bctx.filter = 'blur(7px)';            // smooth radar-like gradients
-  bctx.drawImage(small, 0, 0, big.width, big.height);
-  return big.toDataURL('image/png');
+  // Extra softening pass for a smooth cloud look
+  const out = document.createElement('canvas');
+  out.width = W; out.height = H;
+  const octx = out.getContext('2d');
+  octx.filter = 'blur(10px)';
+  octx.drawImage(cv, 0, 0);
+  return out.toDataURL('image/png');
 }
 
 async function fetchRadarManifest() {
