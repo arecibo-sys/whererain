@@ -377,11 +377,11 @@ function showRadarFrame() {
   const d = new Date(f.time * 1000);
   const hh = d.getHours().toString().padStart(2,'0');
   const mm = d.getMinutes().toString().padStart(2,'0');
-  const minsFwd = Math.round((f.time - Date.now()/1000) / 60);
-  const label = f.kind === 'nowcast'
-    ? `${hh}:${mm} (+${minsFwd}m forecast)`
-    : `${hh}:${mm} (now)`;
-  $('radarTs').textContent = label;
+  const diff = Math.round((f.time - Date.now()/1000) / 60);
+  const tag = f.kind === 'nowcast'
+    ? ` (+${diff}m)`
+    : diff === 0 ? ' (now)' : ` (${Math.abs(diff)}m ago)`;
+  $('radarTs').textContent = `${hh}:${mm}${tag}`;
   $('radarScrub').value = state.radarFrameIdx;
 }
 
