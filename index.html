@@ -345,12 +345,13 @@ async function fetchRadarManifest() {
     const data = await res.json();
     state.radarManifest = data;
     const frames = [];
-    for (const f of (data.radar.past || [])) frames.push({ time: f.time, path: f.path, kind: 'past' });
     for (const f of (data.radar.nowcast || [])) frames.push({ time: f.time, path: f.path, kind: 'nowcast' });
     state.radarFrames = frames;
-    state.radarFrameIdx = (data.radar.past || []).length; // start at "now"
+    state.radarFrameIdx = 0;
     $('radarScrub').max = Math.max(0, frames.length - 1);
-    $('radarMeta').textContent = `${frames.length} frames · ${new Date(frames[0]?.time * 1000).getHours()}:00 → ${Math.round((frames[frames.length-1].time - frames[0].time) / 60)} min`;
+    if (frames.length > 0) {
+      $('radarMeta').textContent = `${frames.length} frames · Forecast ${Math.round((frames[frames.length-1].time - frames[0].time) / 60)} min`;
+    }
     showRadarFrame();
   } catch (e) {
     $('radarMeta').textContent = 'Radar unavailable';
@@ -378,6 +379,7 @@ function radarTick() {
   if (!state.radarPlaying || !state.radarFrames.length) return;
   state.radarFrameIdx = (state.radarFrameIdx + 1) % state.radarFrames.length;
   showRadarFrame();
+  if (state.radarFrameIdx === 0) state.radarFrameIdx = 0;
 }
 
 // ── Open-Meteo ──
@@ -607,7 +609,7 @@ fetchAll();
 setInterval(updateAge, 1000);
 setInterval(fetchAll, 5 * 60 * 1000);
 setInterval(fetchRadarManifest, 10 * 60 * 1000);
-radarTimer = setInterval(radarTick, 2500);
+radarTimer = setInterval(radarTick, 800);
 </script>
 </body>
 </html>
