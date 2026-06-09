@@ -308,7 +308,7 @@ const WMO = {
 const $ = id => document.getElementById(id);
 
 // ── Map init ──
-let map, marker, radarLayerGroup;
+let map, marker, radarImg;
 function initMap() {
   map = L.map('radar-map', { zoomControl: true, attributionControl: true, minZoom: 5, maxZoom: 11 }).setView([state.lat, state.lon], 9);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
@@ -316,7 +316,6 @@ function initMap() {
     attribution: '© OSM © CARTO · Forecast © Open-Meteo'
   }).addTo(map);
   marker = L.marker([state.lat, state.lon]).addTo(map);
-  radarLayerGroup = L.layerGroup().addTo(map);
   map.on('click', e => {
     state.lat = e.latlng.lat; state.lon = e.latlng.lng;
     state.name = `Pin (${state.lat.toFixed(2)}, ${state.lon.toFixed(2)})`;
@@ -333,14 +332,40 @@ const GRID_N = 11;          // 11×11 = 121 sample points
 const SPAN_LAT = 0.9;       // ~100 km tall coverage
 const SPAN_LON = 1.6;       // wider since longitude is compressed at high latitude
 
-// precip (mm/15min) → [color, fillOpacity]
-function precipColor(p) {
-  if (p < 0.05) return null;
-  if (p < 0.3)  return ['#4A90E2', 0.35];
-  if (p < 0.8)  return ['#5BA3F5', 0.5];
-  if (p < 1.8)  return ['#FFD700', 0.6];
-  if (p < 4)    return ['#FF6B6B', 0.7];
-  return ['#B71C1C', 0.8];
+// precip (mm/15min) → [r,g,b,a] (a 0-255)
+function precipRGBA(p) {
+  if (p < 0.05) return [0, 0, 0, 0];
+  if (p < 0.3)  return [74, 144, 226, 140];
+  if (p < 0.8)  return [91, 163, 245, 175];
+  if (p < 1.8)  return [255, 215, 0, 195];
+  if (p < 4)    return [255, 107, 107, 210];
+  return [183, 28, 28, 225];
+}
+
+// Render a grid of precip values into a smooth, blurred radar-like PNG.
+function buildFrameImage(precip) {
+  const N = GRID_N;
+  const small = document.createElement('canvas');
+  small.width = N; small.height = N;
+  const sctx = small.getContext('2d');
+  const img = sctx.createImageData(N, N);
+  for (let r = 0; r < N; r++) {
+    for (let c = 0; c < N; c++) {
+      const [pr, pg, pb, pa] = precipRGBA(precip[r * N + c] || 0);
+      const x = c, y = N - 1 - r;          // image top = north (max lat)
+      const idx = (y * N + x) * 4;
+      img.data[idx] = pr; img.data[idx+1] = pg; img.data[idx+2] = pb; img.data[idx+3] = pa;
+    }
+  }
+  sctx.putImageData(img, 0, 0);
+  const scale = 28;
+  const big = document.createElement('canvas');
+  big.width = N * scale; big.height = N * scale;
+  const bctx = big.getContext('2d');
+  bctx.imageSmoothingEnabled = true; bctx.imageSmoothingQuality = 'high';
+  bctx.filter = 'blur(7px)';            // smooth radar-like gradients
+  bctx.drawImage(small, 0, 0, big.width, big.height);
+  return big.toDataURL('image/png');
 }
 
 async function fetchRadarManifest() {
@@ -376,10 +401,14 @@ async function fetchRadarManifest() {
     const frames = [];
     for (let s = startIdx; s < Math.min(times.length, startIdx + STEPS); s++) {
       const precip = locs.map(l => l.minutely_15?.precipitation?.[s] ?? 0);
-      frames.push({ time: times[s], precip });
+      frames.push({ time: times[s], precip, img: buildFrameImage(precip) });
     }
     if (!frames.length) { $('radarMeta').textContent = 'No forecast data'; return; }
 
+    state.radarBounds = [
+      [cLat - SPAN_LAT/2, cLon - SPAN_LON/2],
+      [cLat + SPAN_LAT/2, cLon + SPAN_LON/2]
+    ];
     state.radarFrames = frames;
     state.radarFrameIdx = 0;
     $('radarScrub').max = frames.length - 1;
@@ -395,20 +424,14 @@ async function fetchRadarManifest() {
 
 function showRadarFrame() {
   const f = state.radarFrames[state.radarFrameIdx];
-  if (!f || !state.grid) return;
-  radarLayerGroup.clearLayers();
-  const hLat = state.gridStepLat / 2, hLon = state.gridStepLon / 2;
-  let maxP = 0;
-  f.precip.forEach((p, i) => {
-    if (p > maxP) maxP = p;
-    const col = precipColor(p);
-    if (!col) return;
-    const g = state.grid[i];
-    L.rectangle(
-      [[g.lat - hLat, g.lon - hLon], [g.lat + hLat, g.lon + hLon]],
-      { stroke: false, fillColor: col[0], fillOpacity: col[1] }
-    ).addTo(radarLayerGroup);
-  });
+  if (!f || !state.radarBounds) return;
+  if (!radarImg) {
+    radarImg = L.imageOverlay(f.img, state.radarBounds, { opacity: 0.78, interactive: false }).addTo(map);
+  } else {
+    radarImg.setBounds(state.radarBounds);
+    radarImg.setUrl(f.img);
+  }
+  const maxP = f.precip.reduce((m, p) => p > m ? p : m, 0);
 
   const d = new Date(f.time * 1000);
   const hh = d.getHours().toString().padStart(2,'0');
